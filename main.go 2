@@ -1,0 +1,636 @@
+package awesomeProject2
+
+import (
+"crypto/x509"
+"encoding/pem"
+"encoding/binary"
+"github.com/golang/protobuf/proto"
+"github.com/hyperledger/fabric/protos/msp"
+"math/rand"
+"encoding/json"
+"errors"
+"strconv"
+"github.com/hyperledger/fabric/core/chaincode/shim"
+pb "github.com/hyperledger/fabric/protos/peer"
+	"fmt"
+)
+
+
+
+type ChainCode struct {
+
+}
+
+func main() {
+	err := shim.Start(&ChainCode{})
+	if err != nil {
+		fmt.Errorf("Error starting Token chaincode: %s", err)
+	}
+}
+
+const IndexProducer = "cn~producer"
+const IndexClient = "cn~client"
+const IndexContent = "cn~content"
+
+const THRESHOLD = 1000
+const ratePerView = 100
+
+const KeySettings = "__settings"
+
+func (t *ChainCode) Init(stub shim.ChaincodeStubInterface) pb.Response {
+	function, args := stub.GetFunctionAndParameters()
+
+
+	if function != "init" {
+		return shim.Error("Expected 'init' function.")
+	}
+
+	if len(args) != 1 {
+		return shim.Error("Expected 1 argument, but got " + strconv.Itoa(len(args)))
+	}
+
+	// get token data from JSON
+	settings := Settings{}
+	err := json.Unmarshal([]byte(args[0]), &settings)
+
+	if err != nil {
+		return shim.Error("Error parsing settings json")
+	}
+
+	err = stub.PutState(KeySettings, []byte(args[0]))
+	if err != nil {
+		return shim.Error("Error saving token data")
+	}
+
+	return shim.Success(nil)
+}
+
+func (t *ChainCode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
+	function, args := stub.GetFunctionAndParameters()
+
+	// call routing
+	switch function {
+	case "info":
+		info, _ := stub.GetState(KeySettings)
+		return shim.Success(info)
+	case "createProducers":
+		return t.createProducers(stub, args)
+	case "createClients":
+		return t.createClients(stub, args)
+	case "publishContent":
+		return t.publishContent(stub, args)
+	case "rewardPublisher":
+		return t.rewardPublisher(stub, args)
+	case "denunciate" :
+		return t.denunciate(stub, args)
+	default:
+		return shim.Error("Incorrect function name: " + function)
+	}
+}
+
+func (t *ChainCode) getSettings(stub shim.ChaincodeStubInterface) (Settings, error) {
+	settingsByteArr, err := stub.GetState(KeySettings)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	settings := Settings{}
+	err = json.Unmarshal(settingsByteArr, &settings)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	return settings, nil
+}
+
+func (t *ChainCode) invalidateContent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 1 {
+		return shim.Error("invalidateContent expected 1 argument")
+	}
+
+
+	settings, err := t.getSettings(stub)
+	if err != nil {
+		return shim.Error("Error getting settings")
+	}
+
+	caller, err := CallerCN(stub)
+	if err != nil {
+		return shim.Error("Error extracting user identity")
+	}
+
+	// only admin is able to create another users
+	if caller != settings.Admin {
+		return shim.Error("I don't know you, " + caller + "!")
+	}
+
+	cont := Content{}
+	err = json.Unmarshal([]byte(args[0]), cont)
+	if err != nil {
+		return shim.Error("Error parsing users[] json")
+	}
+
+	cont.Valid = false
+
+	data, err := json.Marshal(cont)
+	if err != nil {
+		return shim.Error("Error marshaling content")
+	}
+	stub.PutState(cont.ID, data)
+
+
+	return shim.Success(data)
+
+}
+
+func (t *ChainCode) createProducers(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 1 {
+		return shim.Error("createActors expected 1 argument")
+	}
+
+	settings, err := t.getSettings(stub)
+	if err != nil {
+		return shim.Error("Error getting settings")
+	}
+
+	caller, err := CallerCN(stub)
+	if err != nil {
+		return shim.Error("Error extracting user identity")
+	}
+
+	// only admin is able to create another users
+	if caller != settings.Admin {
+		return shim.Error("I don't know you, " + caller + "!")
+	}
+
+	producers := []Producer{}
+	err = json.Unmarshal([]byte(args[0]), &producers)
+	if err != nil {
+		return shim.Error("Error parsing users[] json")
+	}
+
+	for i := 0; i < len(producers); i++ {
+		err := t.createProducer(stub, producers[i].Identifier)
+
+		if err != nil {
+			return shim.Error("Error creating Producer '" + producers[i].Identifier + "'")
+		}
+	}
+
+	b, err := json.Marshal(producers)
+	if err != nil {
+	}
+
+	return shim.Success(b)
+}
+
+func (t *ChainCode) createClients(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 1 {
+		return shim.Error("createActors expected 1 argument")
+	}
+
+	settings, err := t.getSettings(stub)
+	if err != nil {
+		return shim.Error("Error getting settings")
+	}
+
+	caller, err := CallerCN(stub)
+	if err != nil {
+		return shim.Error("Error extracting user identity")
+	}
+
+	// only admin is able to create another users
+	if caller != settings.Admin {
+		return shim.Error("I don't know you, " + caller + "!")
+	}
+
+	clients := []Client{}
+	err = json.Unmarshal([]byte(args[0]), &clients)
+	if err != nil {
+		return shim.Error("Error parsing users[] json")
+	}
+
+	for i := 0; i < len(clients); i++ {
+		err := t.createClient(stub, clients[i].Identifier)
+
+		if err != nil {
+			return shim.Error("Error creating Client '" + clients[i].Identifier + "'")
+		}
+	}
+
+	b, err := json.Marshal(clients)
+	if err != nil {
+	}
+
+	return shim.Success(b)
+}
+
+func (t *ChainCode) publishContent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+
+	caller, err := CallerCN(stub)
+	if err != nil {
+		return shim.Error("Error extracting user identity")
+	}
+
+
+	if len(args) != 1 {
+		return shim.Error("Transfer expected 1 argument")
+	}
+
+	content := Content{}
+	err = json.Unmarshal([]byte(args[0]), &content)
+	if err != nil {
+		return shim.Error("Error parsing transfer json")
+	}
+
+	if (caller  != content.Publisher.Identifier) {
+		return shim.Error("Error, the publisher don't habve the rights")
+
+	}
+	if t.storeContentOnChain(stub, IndexProducer, caller, content) != nil {
+		return shim.Error("Error during write")
+	}
+	result, _ := json.Marshal(content)
+	return shim.Success(result)
+
+}
+
+//API Method to return the file.
+func (t *ChainCode) getContent(stub shim.ChaincodeStubInterface, args []string) ([]byte, error) {
+	if len(args) != 1 {
+		return Content{}.File, errors.New("getContent expected 1 arguement")
+	}
+	data, err := stub.GetState(args[0])
+	if err != nil {
+		return Content{}.File, err
+	}
+	content := Content{}
+	err = json.Unmarshal(data, &content)
+	if err != nil {
+		return Content{}.File, err
+	}
+	return content.File, err
+}
+
+
+//This method is call every time a user watch the full content on the plaform
+func (t *ChainCode) rewardPublisher(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+	if len(args) != 1 {
+		return shim.Error("createActors expected 1 argument")
+	}
+
+	settings, err := t.getSettings(stub)
+	if err != nil {
+		return shim.Error("Error getting settings")
+	}
+
+	caller, err := CallerCN(stub)
+	if err != nil {
+		return shim.Error("Error extracting user identity")
+	}
+
+	// only admin is able to create another users
+	if caller != settings.Admin {
+		return shim.Error("I don't know you, " + caller + "!")
+	}
+
+
+	content := Content{}
+	err = json.Unmarshal([]byte(args[0]), &content)
+	if err != nil {
+		return shim.Error("Error parsing transfer json")
+	}
+
+	for i:= 0 ; i <= len(content.Finances); i++  {
+		prodAttr := content.Finances[i]
+		t.updateBalance(stub, IndexProducer, prodAttr.ProducerOfAtt.Identifier , uint64(float32(ratePerView)*prodAttr.Proportion), false )
+	}
+
+	b, err := json.Marshal(content)
+	if err != nil {
+	}
+
+	return shim.Success(b)
+
+}
+
+
+func (t *ChainCode) voteForContent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	// Arguments needed : content , user , result of vote
+	return shim.Success(nil)
+}
+
+
+func (t *ChainCode) denunciate(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	//here we should check that caller role == client
+	if len(args) != 2 {
+		return shim.Error("Transfer expected 2 argument")
+	}
+
+	stolenContent := Content{}
+	content := Content{}
+	err := json.Unmarshal([]byte(args[0]), &stolenContent)
+	if err != nil {
+		return shim.Error("Error parsing transfer json")
+	}
+	err = json.Unmarshal([]byte(args[1]), &content)
+	if err != nil {
+		return shim.Error("Error parsing transfer json")
+	}
+	//For future improvements (remuneration on Blockchain of cliens)
+	//denunciation := Denunciation{Content:content,StolenContent:stolenContent}
+
+	c, err := stub.GetState(content.ID)
+	if err != nil {
+		return shim.Error("Error Fetching oldContent: " + err.Error())
+	}
+	newContent := Content{}
+	err1 := json.Unmarshal(c,&newContent)
+	if err1 != nil {
+		return shim.Error("Error unmarshal oldContent: " + err1.Error())
+
+	}
+	var denuncedContents = newContent.DenuncedContents
+
+	for i:=0 ; i < len(denuncedContents);i++ {
+		if denuncedContents[i].ContentID == stolenContent.ID  {
+			if denuncedContents[i].Number + 1  >= THRESHOLD {
+				t.notifyProducers(stub,stolenContent)
+			}else {
+				denuncedContents[i].Number++
+			}
+
+		}else {
+			denuncedContents = append(denuncedContents, PairContentDenunced{stolenContent.ID,1})
+			break
+		}
+	}
+	newContent.DenuncedContents = denuncedContents
+
+	data ,err := json.Marshal(newContent)
+	if err != nil {
+		return shim.Error("Error marshal newContent: " + err.Error())
+	}
+	stub.PutState(newContent.ID,data)
+
+	return shim.Success(data)
+}
+
+
+
+func (t *ChainCode) createClient(stub shim.ChaincodeStubInterface, cn string) error {
+	var err error
+
+	err = t.setInitBalance(stub, IndexClient, cn)
+
+	if err != nil {
+		return errors.New("Error creating user '" + cn + "': " + err.Error())
+	}
+
+	return nil
+}
+
+func (t *ChainCode) notifyProducers(stub shim.ChaincodeStubInterface, stolenContent Content) pb.Response {
+
+	var outputData []byte
+
+	for i := 0; i < len(stolenContent.Decisions); i++ {
+
+		producer_data, err := stub.GetState(stolenContent.Decisions[i].ProducerOfAtt.Identifier)
+
+		if err != nil {
+			return shim.Error("Error fetching the producer that has the stolen content")
+		}
+		producer := Producer{}
+		err1 := json.Unmarshal(producer_data, &producer)
+		if err1 != nil {
+			return shim.Error("Error unmarshal content: " + err1.Error())
+		}
+
+		producer.MessageFromOutside += "\n Hey Producer " + stolenContent.Decisions[i].ProducerOfAtt.Identifier + " your fans claim that somebody has stolen your content ( " + stolenContent.ID + " ) would you like to " +
+			"submit your media to the community for verification ? "
+
+		data, err := json.Marshal(&producer)
+		if err != nil {
+			return shim.Error("Error marshal producer: " + err.Error())
+		}
+		stub.PutState(producer.Identifier, data)
+		outputData = data
+	}
+
+	return shim.Success(outputData)
+
+}
+
+func (t *ChainCode) producerExists(stub shim.ChaincodeStubInterface, cn string) bool {
+	var prefix string
+
+	key, _ := stub.CreateCompositeKey(prefix, []string{cn})
+
+	data, err := stub.GetState(key)
+	if err != nil {
+		return false
+	} else if data == nil {
+		return false
+	}
+
+	return true
+}
+
+func (t *ChainCode) createProducer(stub shim.ChaincodeStubInterface, cn string) error {
+	var err error
+
+	err = t.setInitBalance(stub, IndexProducer, cn)
+
+	if err != nil {
+		return errors.New("Error creating user '" + cn + "': " + err.Error())
+	}
+
+	return nil
+}
+
+
+
+
+func (t *ChainCode) setInitBalance(stub shim.ChaincodeStubInterface, prefix string, cn string) error {
+	key,_ := stub.CreateCompositeKey(prefix, []string{cn})
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, 0)
+	return stub.PutState(key, data)
+}
+
+func (t *ChainCode) updateBalance(stub shim.ChaincodeStubInterface, prefix string, cn string, delta uint64, negSign bool) error {
+
+	key, _ := stub.CreateCompositeKey(prefix, []string{cn})
+	data, err := stub.GetState(key)
+	if err != nil {
+		return err
+	} else if data == nil {
+		return errors.New("User '" + cn + "' doesn't exist")
+	}
+
+	newBalance := binary.LittleEndian.Uint64(data)
+
+	if negSign {
+		if newBalance - delta < 0 {
+			return errors.New("balance of user '" + cn + "' is to small to proceed transaction")
+		}
+		newBalance -= delta
+	} else {
+		newBalance += delta
+	}
+
+	data = make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, newBalance)
+	return stub.PutState(key, data)
+}
+
+func (t *ChainCode) getBalance(stub shim.ChaincodeStubInterface, prefix string, cn string) (uint64, error) {
+	key, _ := stub.CreateCompositeKey(prefix, []string{cn})
+	data, err := stub.GetState(key)
+	if err != nil {
+		return 0, err
+	}
+
+	// if the user cn is not in the state, then the userBalance is 0
+	if data == nil {
+		return 0, errors.New("User '" + cn + "' doesn't exist!")
+	}
+
+	return binary.LittleEndian.Uint64(data), nil
+}
+
+func (t *ChainCode) storeContentOnChain(stub shim.ChaincodeStubInterface, prefix string, cn string, content Content) error {
+
+	key, _ := stub.CreateCompositeKey(prefix, []string{cn})
+
+	data, _ := json.Marshal(content)
+
+	return stub.PutState(key, data)
+}
+
+func  (t *ChainCode) getContentFormChain(stub shim.ChaincodeStubInterface, prefix string, cn string) (Content, error) {
+	key, _ := stub.CreateCompositeKey(prefix, []string{cn})
+	data, _ := stub.GetState(key)
+	content := Content{}
+	err := json.Unmarshal(data, &content)
+
+	return content, err
+}
+
+func parsePEM(certPEM string) (*x509.Certificate, error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil, errors.New("Failed to parse PEM certificate")
+	}
+
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// extracts CN from an x509 certificate
+func CNFromX509(certPEM string) (string, error) {
+	cert, err := parsePEM(certPEM)
+	if err != nil {
+		return "", errors.New("Failed to parse certificate: " + err.Error())
+	}
+	return cert.Subject.CommonName, nil
+}
+
+// extracts CN from caller of a chaincode function
+func CallerCN(stub shim.ChaincodeStubInterface) (string, error) {
+	data, _ := stub.GetCreator()
+	serializedId := msp.SerializedIdentity{}
+	err := proto.Unmarshal(data, &serializedId)
+	if err != nil {
+		return "", errors.New("Could not unmarshal Creator")
+	}
+
+	cn, err := CNFromX509(string(serializedId.IdBytes))
+	if err != nil {
+		return "", err
+	}
+	return cn, nil
+}
+
+func uintToString(num uint64) (string) {
+	return strconv.FormatUint(num, 10)
+}
+
+func uint64Random() uint64 {
+	return uint64(rand.Uint32())<<32 + uint64(rand.Uint32())
+}
+
+type Complaint struct {
+	Complainer Producer `json:"complainer"`
+	Accused Producer `json:"accused"`
+	ComplainerContent Content `json:"complainerContent"`
+	AccusedContent Content `json:"accusedContent"`
+	IsValid bool `json:"isValid"`
+}
+
+type Content struct {
+	Finances []ProducerAttribution `json:"financial"`
+	Decisions []ProducerAttribution `json:"decisional"`
+	ID string `json:"id"`
+	Role string  `json:"role"`
+	File []byte`json:"file"`
+	DenuncedContents []PairContentDenunced `json:"denuncedcontent"`
+	Copyrightstate string `json:"copyrightstate"`
+	Valid bool `json:"valid"`
+	Publisher Producer `json:"publisher"`
+}
+
+type PairContentDenunced struct {
+	ContentID string `json:"contentID"`
+	Number uint `json:"number"`
+}
+
+type Denunciation struct{
+	StolenContent Content `json:"stolen_content"`
+	Content Content`json:"content"`
+	State string `json:"state"`
+	ID string `json:"id"`
+
+}
+
+
+
+type ProducerAttribution struct{
+	ProducerOfAtt Producer `json:"producerofatt"`
+	Proportion  float32 `json:"proportion"`
+
+}
+
+
+
+type Client struct {
+	IsPremium bool `json:"isPremium"`
+	Balance uint64 `json:"clientBalance"`
+	Identifier string `json:"id"`
+	Role string `json:"role"`
+
+}
+
+type Producer struct {
+	Identifier 	string `json:"id"`
+	Balance int `json:"producerBalance"`
+	MessageFromOutside string `json:"stolenList"`
+	Role string `json:"role"`
+}
+
+
+type Settings struct {
+	Admin        string `json:"admin"`
+}
+
+
+type ValueType string
+
+const (
+	String  = ValueType("string")
+	UInt64 	= ValueType("uInt64")
+)
+
+
